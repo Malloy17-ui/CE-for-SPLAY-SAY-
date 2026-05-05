@@ -1,0 +1,322 @@
+//@version=6
+indicator(title             = "Malloy Labs · Confluence Engine  v3",
+          shorttitle        = "ML·CE",
+          overlay           = true,
+          max_lines_count   = 500,
+          max_labels_count  = 200,
+          max_boxes_count   = 100)
+
+
+// ─── INPUTS ─────────────────────────────────────────────────────────────
+
+gE = "EMAs"
+showEMAs   = input.bool(true,  "Show EMAs",          group = gE)
+fastLen    = input.int(7,      "Fast EMA",           group = gE, minval = 2, maxval = 50)
+slowLen    = input.int(20,     "Slow EMA",           group = gE, minval = 5, maxval = 200)
+
+gL = "Levels — toggle individually"
+showPWH    = input.bool(true, "Previous Week High",  group = gL)
+showPWL    = input.bool(true, "Previous Week Low",   group = gL)
+showPDH    = input.bool(true, "Previous Day High",   group = gL)
+showPDL    = input.bool(true, "Previous Day Low",    group = gL)
+showPDC    = input.bool(true, "Previous Day Close",  group = gL)
+showPHH    = input.bool(true, "Previous Hour High",  group = gL)
+showPHL    = input.bool(true, "Previous Hour Low",   group = gL)
+showORB    = input.bool(true, "Opening Range (15m)", group = gL,
+     tooltip = "High and low of the first 15 minutes of the regular trading hours session.")
+
+gO = "Opening Range"
+orbMinutes = input.int(15, "ORB Window (minutes)", group = gO, minval = 5, maxval = 60)
+useRTH     = input.bool(true, "Use Regular Trading Hours session", group = gO)
+
+gW = "Wick Rejection — strictness"
+minWickRatio = input.float(0.50, "Min wick / bar range",
+     minval = 0.30, maxval = 0.80, step = 0.05, group = gW,
+     tooltip = "The rejection wick (lower wick for longs, upper for shorts) must be at least this fraction of the bar's total range. 0.50 means the wick must be at least half the bar's height. Higher values demand more dramatic rejections.")
+maxClosePosition = input.float(0.40, "Max close-in-range",
+     minval = 0.20, maxval = 0.60, step = 0.05, group = gW,
+     tooltip = "For a long setup, close must be in the UPPER portion of the bar (close-from-low ÷ range ≥ 1 − this). 0.40 means close must be in the upper 60% of the bar. Lower values demand the close be even closer to the high.")
+requirePierce = input.bool(true, "Wick must pierce EMA/level",
+     group = gW,
+     tooltip = "When ON, the rejection wick must actually touch or break through the EMA or level (low ≤ EMA for longs). When OFF, falls back to ATR-proximity matching, which is much looser.")
+proxATR = input.float(0.15, "Fallback proximity (× ATR)",
+     minval = 0.05, maxval = 1.0, step = 0.05, group = gW,
+     tooltip = "Used only when 'Wick must pierce' is OFF. ATR-scaled tolerance for 'wick near EMA/level'.")
+
+gF = "Trend & Alignment Filters"
+requireEMAAlign  = input.bool(true, "Require EMA alignment",
+     group = gF,
+     tooltip = "Longs only when emaFast > emaSlow. Shorts only when emaFast < emaSlow.")
+requireEMASlope  = input.bool(true, "Require fast EMA sloping correctly",
+     group = gF,
+     tooltip = "Longs require emaFast > emaFast[1]. Filters out chop. Recommended ON.")
+
+gK = "Setup Source"
+showUEntries     = input.bool(true, "U-shape entries (wick near EMA)",       group = gK)
+showLevelEntries = input.bool(true, "Key-level rejection entries",            group = gK)
+
+gA = "Alerts"
+alertOnLong  = input.bool(true, "Fire alert on long triggers",  group = gA)
+alertOnShort = input.bool(true, "Fire alert on short triggers", group = gA)
+
+gS = "Style"
+showLabels = input.bool(true, "Show level labels (right side)", group = gS)
+showRibbon = input.bool(false, "Fill between EMAs",            group = gS)
+
+atrLen = 14
+
+
+// ─── PALETTE  (TradingView-native, matches client's existing chart) ─────
+cFastEMA   = #00C4D9
+cSlowEMA   = #F5C842
+cORB       = #E91E63
+cPDC       = #C448C4
+cPDH       = #C448C4
+cPDL       = #C448C4
+cPWH       = #4A148C
+cPWL       = #4CAF50
+cPHH       = #FF9800
+cPHL       = #FF9800
+cLongTrig  = #2196F3
+cShortTrig = #F44336
+cLabelBg   = #1a1a1a
+
+
+// ─── EMAs & ATR ─────────────────────────────────────────────────────────
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+atrVal  = ta.atr(atrLen)
+
+emaFastPlot = plot(showEMAs ? emaFast : na, "Fast EMA", color = cFastEMA, linewidth = 2)
+emaSlowPlot = plot(showEMAs ? emaSlow : na, "Slow EMA", color = cSlowEMA, linewidth = 2)
+
+fill(emaFastPlot, emaSlowPlot,
+     color = showRibbon and showEMAs ? color.new(emaFast > emaSlow ? cFastEMA : cShortTrig, 92) : na,
+     title = "EMA ribbon")
+
+
+// ─── KEY LEVELS — DAILY/WEEKLY/HOURLY ───────────────────────────────────
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1], close[1]],
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+[pwh, pwl] = request.security(syminfo.tickerid, "W",
+     [high[1], low[1]],
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+[phh, phl] = request.security(syminfo.tickerid, "60",
+     [high[1], low[1]],
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+
+// ─── OPENING RANGE  (anchored to RTH session) ───────────────────────────
+inSession    = useRTH ? not na(time(timeframe.period, session.regular)) : true
+sessionStart = inSession and not inSession[1]
+
+var int   orbStartTime = na
+var float orbHigh      = na
+var float orbLow       = na
+var bool  orbActive    = false
+var bool  orbLocked    = false
+
+if sessionStart
+    orbStartTime := time
+    orbHigh      := high
+    orbLow       := low
+    orbActive    := true
+    orbLocked    := false
+
+if orbActive and not orbLocked
+    elapsedMs = time - orbStartTime
+    if elapsedMs <= orbMinutes * 60 * 1000
+        orbHigh := math.max(nz(orbHigh, high), high)
+        orbLow  := math.min(nz(orbLow,  low),  low)
+    else
+        orbLocked := true
+        orbActive := false
+
+
+// ─── PLOT LEVELS ────────────────────────────────────────────────────────
+plot(showPWH and not na(pwh) ? pwh : na, "PWH", color = cPWH, linewidth = 2, style = plot.style_linebr)
+plot(showPWL and not na(pwl) ? pwl : na, "PWL", color = cPWL, linewidth = 2, style = plot.style_linebr)
+plot(showPDH and not na(pdh) ? pdh : na, "PDH", color = cPDH, linewidth = 1, style = plot.style_linebr)
+plot(showPDL and not na(pdl) ? pdl : na, "PDL", color = cPDL, linewidth = 1, style = plot.style_linebr)
+plot(showPDC and not na(pdc) ? pdc : na, "PDC", color = cPDC, linewidth = 2, style = plot.style_linebr)
+plot(showPHH and not na(phh) ? phh : na, "PHH", color = cPHH, linewidth = 1, style = plot.style_linebr)
+plot(showPHL and not na(phl) ? phl : na, "PHL", color = cPHL, linewidth = 1, style = plot.style_linebr)
+plot(showORB and not na(orbHigh) ? orbHigh : na, "ORB High", color = cORB, linewidth = 1, style = plot.style_linebr)
+plot(showORB and not na(orbLow)  ? orbLow  : na, "ORB Low",  color = cORB, linewidth = 1, style = plot.style_linebr)
+
+
+// ─── LEVEL LABELS ───────────────────────────────────────────────────────
+makeLabel(string txt, float y, color c) =>
+    if showLabels and not na(y) and barstate.islast
+        label.new(bar_index + 5, y, txt,
+             style = label.style_label_left,
+             color = color.new(cLabelBg, 30),
+             textcolor = c, size = size.small)
+
+if barstate.islast
+    if showPWH
+        makeLabel("PWH", pwh, cPWH)
+    if showPWL
+        makeLabel("PWL", pwl, cPWL)
+    if showPDH
+        makeLabel("PDH", pdh, cPDH)
+    if showPDL
+        makeLabel("PDL", pdl, cPDL)
+    if showPDC
+        makeLabel("PDC", pdc, cPDC)
+    if showPHH
+        makeLabel("PHH", phh, cPHH)
+    if showPHL
+        makeLabel("PHL", phl, cPHL)
+    if showORB
+        makeLabel("ORB HIGH", orbHigh, cORB)
+        makeLabel("ORB LOW",  orbLow,  cORB)
+
+
+// ════════════════════════════════════════════════════════════════════════
+//
+//   STRICT WICK-REJECTION LOGIC
+//   ────────────────────────────────────────────────────────────────────
+//   The trigger fires AFTER a clean rejection bar. The rejection bar
+//   (bar-1) must have a visible wick into the EMA/level zone AND close
+//   in the rejected direction. The current bar (the trigger bar) must
+//   then take out the rejection bar's high (long) or low (short).
+//
+// ════════════════════════════════════════════════════════════════════════
+
+
+// ─── REJECTION BAR ANATOMY  (evaluated on bar-1) ────────────────────────
+// All measurements use bar[1] — the bar BEFORE the trigger bar.
+prevRange     = high[1] - low[1]
+prevLowerWick = math.min(open[1], close[1]) - low[1]
+prevUpperWick = high[1] - math.max(open[1], close[1])
+prevClosePos  = prevRange > 0 ? (close[1] - low[1]) / prevRange : 0.5
+
+prevLowerWickRatio = prevRange > 0 ? prevLowerWick / prevRange : 0.0
+prevUpperWickRatio = prevRange > 0 ? prevUpperWick / prevRange : 0.0
+
+
+// ─── HAS-A-REAL-WICK CHECK  (bar-1) ─────────────────────────────────────
+hasLowerWick = prevLowerWickRatio >= minWickRatio and
+               prevClosePos >= (1.0 - maxClosePosition)
+
+hasUpperWick = prevUpperWickRatio >= minWickRatio and
+               prevClosePos <= maxClosePosition
+
+
+// ─── DID THE WICK PIERCE THE EMA OR A LEVEL?  (bar-1) ───────────────────
+// If requirePierce is ON: low[1] ≤ EMA[1] for longs (wick pierced through).
+// If OFF: falls back to ATR-proximity (wick low within proxATR of EMA[1]).
+emaTol = atrVal * proxATR
+
+emaPierceLong  = requirePierce ?
+                 low[1]  <= emaFast[1] :
+                 math.abs(low[1]  - emaFast[1]) <= emaTol
+
+emaPierceShort = requirePierce ?
+                 high[1] >= emaFast[1] :
+                 math.abs(high[1] - emaFast[1]) <= emaTol
+
+
+// ─── LEVEL PIERCE CHECK  (bar-1, single-level match) ────────────────────
+// "near level" means low[1] ≤ lvl (wick pierced from above) for longs,
+// or high[1] ≥ lvl (wick pierced from below) for shorts.
+levelPierceLong(float lvl) =>
+    not na(lvl) and (requirePierce ?
+        low[1]  <= lvl and high[1] > lvl :
+        math.abs(low[1] - lvl) <= atrVal * proxATR)
+
+levelPierceShort(float lvl) =>
+    not na(lvl) and (requirePierce ?
+        high[1] >= lvl and low[1] < lvl :
+        math.abs(high[1] - lvl) <= atrVal * proxATR)
+
+anyLongLevelPierce  = (showPWL and levelPierceLong(pwl))    or
+                      (showPDL and levelPierceLong(pdl))    or
+                      (showPDC and levelPierceLong(pdc))    or
+                      (showPHL and levelPierceLong(phl))    or
+                      (showORB and levelPierceLong(orbLow))
+
+anyShortLevelPierce = (showPWH and levelPierceShort(pwh))   or
+                      (showPDH and levelPierceShort(pdh))   or
+                      (showPDC and levelPierceShort(pdc))   or
+                      (showPHH and levelPierceShort(phh))   or
+                      (showORB and levelPierceShort(orbHigh))
+
+
+// ─── ALIGNMENT FILTERS ──────────────────────────────────────────────────
+emaAlignedLong  = (not requireEMAAlign or emaFast > emaSlow) and
+                  (not requireEMASlope or emaFast > emaFast[1])
+
+emaAlignedShort = (not requireEMAAlign or emaFast < emaSlow) and
+                  (not requireEMASlope or emaFast < emaFast[1])
+
+
+// ─── COMBINED ENTRY TRIGGERS ────────────────────────────────────────────
+// Long: rejection wick on bar-1 + current bar takes out bar-1 high
+// + EMA aligned + alignment passing.
+uShapeLong = showUEntries and
+             hasLowerWick and
+             emaPierceLong and
+             high > high[1] and
+             emaAlignedLong
+
+uShapeShort = showUEntries and
+              hasUpperWick and
+              emaPierceShort and
+              low < low[1] and
+              emaAlignedShort
+
+levelLong  = showLevelEntries and
+             hasLowerWick and
+             anyLongLevelPierce and
+             high > high[1] and
+             emaAlignedLong
+
+levelShort = showLevelEntries and
+             hasUpperWick and
+             anyShortLevelPierce and
+             low < low[1] and
+             emaAlignedShort
+
+
+// ─── DEDUPE  — only fire one type per bar ───────────────────────────────
+longTrigger  = uShapeLong  or (levelLong  and not uShapeLong)
+shortTrigger = uShapeShort or (levelShort and not uShapeShort)
+
+
+// ─── ENTRY ARROWS ───────────────────────────────────────────────────────
+plotshape(longTrigger,
+     title    = "Long Trigger",
+     style    = shape.triangleup,
+     location = location.belowbar,
+     color    = cLongTrig,
+     size     = size.small)
+
+plotshape(shortTrigger,
+     title    = "Short Trigger",
+     style    = shape.triangledown,
+     location = location.abovebar,
+     color    = cShortTrig,
+     size     = size.small)
+
+
+// ─── ALERTS ─────────────────────────────────────────────────────────────
+alertcondition(alertOnLong and uShapeLong,
+     title   = "U-shape LONG",
+     message = "ML·CE — U-shape LONG on {{ticker}} {{interval}}. Rejection wick pierced fast EMA, took out prior bar high.")
+
+alertcondition(alertOnShort and uShapeShort,
+     title   = "U-shape SHORT",
+     message = "ML·CE — U-shape SHORT on {{ticker}} {{interval}}. Rejection wick pierced fast EMA from above, broke prior bar low.")
+
+alertcondition(alertOnLong and levelLong,
+     title   = "Key-level LONG",
+     message = "ML·CE — Key-level LONG on {{ticker}} {{interval}}. Rejection wick pierced support, took out prior bar high.")
+
+alertcondition(alertOnShort and levelShort,
+     title   = "Key-level SHORT",
+     message = "ML·CE — Key-level SHORT on {{ticker}} {{interval}}. Rejection wick pierced resistance, broke prior bar low.")
