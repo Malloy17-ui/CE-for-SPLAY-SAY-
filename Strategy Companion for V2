@@ -1,0 +1,214 @@
+//@version=6
+strategy(title             = "Malloy Labs · Confluence Engine — Strategy v2",
+         shorttitle         = "ML·CE-S",
+         overlay            = true,
+         initial_capital    = 25000,
+         default_qty_type   = strategy.fixed,
+         default_qty_value  = 1,
+         pyramiding         = 0,
+         commission_type    = strategy.commission.cash_per_contract,
+         commission_value   = 1.50)
+
+
+// ─── INPUTS ─────────────────────────────────────────────────────────────
+
+gE = "EMAs"
+fastLen = input.int(7,  "Fast EMA", group = gE, minval = 2, maxval = 50)
+slowLen = input.int(20, "Slow EMA", group = gE, minval = 5, maxval = 200)
+
+gL = "Levels — toggle individually"
+showPWH = input.bool(true, "Previous Week High",  group = gL)
+showPWL = input.bool(true, "Previous Week Low",   group = gL)
+showPDH = input.bool(true, "Previous Day High",   group = gL)
+showPDL = input.bool(true, "Previous Day Low",    group = gL)
+showPDC = input.bool(true, "Previous Day Close",  group = gL)
+showPHH = input.bool(true, "Previous Hour High",  group = gL)
+showPHL = input.bool(true, "Previous Hour Low",   group = gL)
+showORB = input.bool(true, "Opening Range (15m)", group = gL)
+
+gO = "Opening Range"
+orbMinutes = input.int(15, "ORB Window (minutes)", group = gO, minval = 5, maxval = 60)
+
+gW = "Wick Rejection"
+minWickRatio     = input.float(0.50, "Min wick / bar range",     group = gW, minval = 0.30, maxval = 0.80, step = 0.05)
+maxClosePosition = input.float(0.40, "Max close-in-range",       group = gW, minval = 0.20, maxval = 0.60, step = 0.05)
+requirePierce    = input.bool(true,  "Wick must pierce EMA/level", group = gW)
+proxATR          = input.float(0.15, "Fallback proximity (× ATR)", group = gW, minval = 0.05, maxval = 1.0, step = 0.05)
+
+gF = "Trend & Alignment Filters"
+requireEMAAlign  = input.bool(true, "Require EMA stack",                       group = gF)
+requireEMASlope  = input.bool(true, "Require fast EMA sloping correctly",      group = gF)
+requireCloseSide = input.bool(true, "Require close on correct side of fast EMA", group = gF)
+
+gK = "Setup Source"
+showUEntries     = input.bool(true, "U-shape entries",        group = gK)
+showLevelEntries = input.bool(true, "Key-level entries",       group = gK)
+
+gT = "Stop & Target"
+stopPts = input.float(22.5, "Stop loss (points)",   group = gT, minval = 0.25, step = 0.25)
+tgtPts  = input.float(12.5, "Take profit (points)", group = gT, minval = 0.25, step = 0.25)
+
+gSe = "Session Filter"
+useSessionFilter = input.bool(true,         "Limit entries to session",     group = gSe)
+sessionWindow    = input.session("0930-1600", "Session window",              group = gSe)
+
+atrLen = 14
+
+
+// ─── EMAs & ATR ─────────────────────────────────────────────────────────
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+atrVal  = ta.atr(atrLen)
+
+plot(emaFast, "Fast EMA", color = color.new(#00C4D9, 0), linewidth = 2)
+plot(emaSlow, "Slow EMA", color = color.new(#F5C842, 0), linewidth = 2)
+
+
+// ─── KEY LEVELS ─────────────────────────────────────────────────────────
+[pdh, pdl, pdc] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1], close[1]],
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+[pwh, pwl] = request.security(syminfo.tickerid, "W",
+     [high[1], low[1]],
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+[phh, phl] = request.security(syminfo.tickerid, "60",
+     [high[1], low[1]],
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+
+// ─── OPENING RANGE  (anchored to RTH session) ───────────────────────────
+inSession    = not na(time(timeframe.period, session.regular))
+sessionStart = inSession and not inSession[1]
+
+var int   orbStartTime = na
+var float orbHigh      = na
+var float orbLow       = na
+var bool  orbActive    = false
+var bool  orbLocked    = false
+
+if sessionStart
+    orbStartTime := time
+    orbHigh      := high
+    orbLow       := low
+    orbActive    := true
+    orbLocked    := false
+
+if orbActive and not orbLocked
+    elapsedMs = time - orbStartTime
+    if elapsedMs <= orbMinutes * 60 * 1000
+        orbHigh := math.max(nz(orbHigh, high), high)
+        orbLow  := math.min(nz(orbLow,  low),  low)
+    else
+        orbLocked := true
+        orbActive := false
+
+
+// ─── PLOT LEVELS ────────────────────────────────────────────────────────
+plot(showPWH and not na(pwh) ? pwh : na, "PWH", color = #4A148C, linewidth = 2, style = plot.style_linebr)
+plot(showPWL and not na(pwl) ? pwl : na, "PWL", color = #4CAF50, linewidth = 2, style = plot.style_linebr)
+plot(showPDH and not na(pdh) ? pdh : na, "PDH", color = #C448C4, linewidth = 1, style = plot.style_linebr)
+plot(showPDL and not na(pdl) ? pdl : na, "PDL", color = #C448C4, linewidth = 1, style = plot.style_linebr)
+plot(showPDC and not na(pdc) ? pdc : na, "PDC", color = #C448C4, linewidth = 2, style = plot.style_linebr)
+plot(showPHH and not na(phh) ? phh : na, "PHH", color = #FF9800, linewidth = 1, style = plot.style_linebr)
+plot(showPHL and not na(phl) ? phl : na, "PHL", color = #FF9800, linewidth = 1, style = plot.style_linebr)
+plot(showORB and not na(orbHigh) ? orbHigh : na, "ORB High", color = #E91E63, linewidth = 1, style = plot.style_linebr)
+plot(showORB and not na(orbLow)  ? orbLow  : na, "ORB Low",  color = #E91E63, linewidth = 1, style = plot.style_linebr)
+
+
+// ─── SESSION GATE ───────────────────────────────────────────────────────
+inSignalSession = useSessionFilter ? not na(time(timeframe.period, sessionWindow)) : true
+
+
+// ─── REJECTION BAR ANATOMY  (bar-1) ─────────────────────────────────────
+prevRange     = high[1] - low[1]
+prevLowerWick = math.min(open[1], close[1]) - low[1]
+prevUpperWick = high[1] - math.max(open[1], close[1])
+prevClosePos  = prevRange > 0 ? (close[1] - low[1]) / prevRange : 0.5
+
+prevLowerWickRatio = prevRange > 0 ? prevLowerWick / prevRange : 0.0
+prevUpperWickRatio = prevRange > 0 ? prevUpperWick / prevRange : 0.0
+
+hasLowerWick = prevLowerWickRatio >= minWickRatio and prevClosePos >= (1.0 - maxClosePosition)
+hasUpperWick = prevUpperWickRatio >= minWickRatio and prevClosePos <= maxClosePosition
+
+
+// ─── PIERCE CHECKS  (bar-1) ─────────────────────────────────────────────
+emaTol = atrVal * proxATR
+
+emaPierceLong  = requirePierce ? low[1]  <= emaFast[1] : math.abs(low[1]  - emaFast[1]) <= emaTol
+emaPierceShort = requirePierce ? high[1] >= emaFast[1] : math.abs(high[1] - emaFast[1]) <= emaTol
+
+levelPierceLong(float lvl) =>
+    not na(lvl) and (requirePierce ? low[1] <= lvl and high[1] > lvl : math.abs(low[1] - lvl) <= atrVal * proxATR)
+
+levelPierceShort(float lvl) =>
+    not na(lvl) and (requirePierce ? high[1] >= lvl and low[1] < lvl : math.abs(high[1] - lvl) <= atrVal * proxATR)
+
+anyLongLevelPierce  = (showPWL and levelPierceLong(pwl)) or (showPDL and levelPierceLong(pdl)) or (showPDC and levelPierceLong(pdc)) or (showPHL and levelPierceLong(phl)) or (showORB and levelPierceLong(orbLow))
+anyShortLevelPierce = (showPWH and levelPierceShort(pwh)) or (showPDH and levelPierceShort(pdh)) or (showPDC and levelPierceShort(pdc)) or (showPHH and levelPierceShort(phh)) or (showORB and levelPierceShort(orbHigh))
+
+
+// ─── ALIGNMENT FILTERS ──────────────────────────────────────────────────
+emaAlignedLong  = (not requireEMAAlign or emaFast > emaSlow) and (not requireEMASlope or emaFast > emaFast[1]) and (not requireCloseSide or close > emaFast)
+emaAlignedShort = (not requireEMAAlign or emaFast < emaSlow) and (not requireEMASlope or emaFast < emaFast[1]) and (not requireCloseSide or close < emaFast)
+
+
+// ─── ENTRY CONDITIONS  (no latch — strategy uses raw signals) ───────────
+crossedHigh = high > high[1]
+crossedLow  = low  < low[1]
+
+uShapeLong  = showUEntries     and crossedHigh and hasLowerWick and emaPierceLong       and emaAlignedLong  and inSignalSession
+uShapeShort = showUEntries     and crossedLow  and hasUpperWick and emaPierceShort      and emaAlignedShort and inSignalSession
+levelLong   = showLevelEntries and crossedHigh and hasLowerWick and anyLongLevelPierce  and emaAlignedLong  and inSignalSession
+levelShort  = showLevelEntries and crossedLow  and hasUpperWick and anyShortLevelPierce and emaAlignedShort and inSignalSession
+
+longTrigger  = uShapeLong  or levelLong
+shortTrigger = uShapeShort or levelShort
+
+
+// ─── VISUAL CONFIRMATION ARROWS ─────────────────────────────────────────
+plotshape(longTrigger,  title = "Long",  style = shape.triangleup,   location = location.belowbar, color = #2196F3, size = size.small)
+plotshape(shortTrigger, title = "Short", style = shape.triangledown, location = location.abovebar, color = #F44336, size = size.small)
+
+
+// ─── STRATEGY ENTRIES & EXITS ───────────────────────────────────────────
+// Track entry price and direction explicitly. Use strategy.close on
+// hard price hits rather than strategy.exit, which has quirks with
+// stop/limit order placement on Pine v6 strategies.
+
+var float entryPx  = na
+var int   entryDir = 0  // 1 = long, -1 = short, 0 = flat
+
+// Entries
+if longTrigger and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    entryPx  := close
+    entryDir := 1
+
+if shortTrigger and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+    entryPx  := close
+    entryDir := -1
+
+// Exits — close position when price reaches stop or target distance from entry
+if entryDir == 1 and strategy.position_size > 0
+    if low <= entryPx - stopPts
+        strategy.close("Long", comment = "Stop")
+        entryDir := 0
+        entryPx  := na
+    else if high >= entryPx + tgtPts
+        strategy.close("Long", comment = "Target")
+        entryDir := 0
+        entryPx  := na
+
+if entryDir == -1 and strategy.position_size < 0
+    if high >= entryPx + stopPts
+        strategy.close("Short", comment = "Stop")
+        entryDir := 0
+        entryPx  := na
+    else if low <= entryPx - tgtPts
+        strategy.close("Short", comment = "Target")
+        entryDir := 0
+        entryPx  := na
